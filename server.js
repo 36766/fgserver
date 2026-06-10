@@ -572,14 +572,13 @@ function processControls(f, opp, inp, taps, g) {
         else if (f.doubleJump)         doJump(f, false)
     }
 
-    // Attack
-    if (taps.has("attack") && f.attackCooldown <= 0) {
+if (taps.has("attack") && f.attackCooldown <= 0) {
         let dir = "neutral"
         if (inp.held.jump)                       dir = "up"
         else if (inp.held.down)                  dir = "down"
         else if (inp.held.left || inp.held.right) dir = "forward"
         if (f.jumpSquatFrames > 0) { f.jumpSquatFrames = 0; f.jumpQueued = false }
-        doAttack(f, dir)
+        doAttack(f, dir, g)
     }
 
     // Special
@@ -595,7 +594,7 @@ function getDashVec(inp) {
 }
 
 // ─── Attack / special ─────────────────────────────────────────────────────────
-function doAttack(f, direction) {
+function doAttack(f, direction, g) {
     if (f.attackCooldown > 0) return
     const m = getMoveset(f.characterName, direction, f.onGround)
     if (!m) return
@@ -603,6 +602,19 @@ function doAttack(f, direction) {
     f.attackCooldown   = m.cooldown
     for (const hd of m.hitboxes) {
         f.delayedHitboxes.push({ ...hd, frames: hd.delayFrames || 0 })
+    }
+    // Signal clients to play the PNG animation
+    if (g) {
+        g.pendingEvents.push({
+            type: "attackFx",
+            applyAtFrame: g.frame,
+            data: {
+                playerIdx: g.fighters.indexOf(f),
+                direction,
+                onGround: f.onGround,
+                characterName: f.characterName
+            }
+        })
     }
 }
 
@@ -736,9 +748,11 @@ function activateBurst(f, opp, g) {
 function triggerWitchTime(f, opp, g) {
     if (f.shield < f.shieldMax) return
     f.shield = 0; f.doubleJump = true
-    g.witchTime = { frames: WITCH_DURATION, ownerIdx: g.fighters.indexOf(f), targetIdx: g.fighters.indexOf(opp) }
+    const ownerIdx = g.fighters.indexOf(f)
+    g.witchTime = { frames: WITCH_DURATION, ownerIdx, targetIdx: g.fighters.indexOf(opp) }
     f.witchTimeOwner = true; opp.witchTimeVictim = true
     opp.hitboxes = []; opp.delayedHitboxes = []
+    g.pendingEvents.push({ type: "witchTimeFx", applyAtFrame: g.frame, data: { ownerIdx } })
 }
 
 function triggerJudgementCut(f, opp, g) {
@@ -795,7 +809,7 @@ function runHitDetection(attacker, defender, g) {
             if (defender.parryDashFrames > 0) { defender.vx = defender.parryDashVX; defender.vy = defender.parryDashVY }
             else { defender.vx = 0; defender.vy = 0; defender.parryFrames = 0 }
             defender.shield = Math.min(defender.shieldMax, defender.shield + PARRY_REFUND)
-            g.pendingEvents.push({ type: "parryFx", applyAtFrame: g.frame, data: { x: defender.x + defender.w/2, y: defender.y + defender.h/2 } })
+            g.pendingEvents.push({ type: "parryFx", applyAtFrame: g.frame, data: { x: defender.x + defender.w/2, y: defender.y + defender.h/2, defenderIdx: g.fighters.indexOf(defender) } })
             return
         }
 
@@ -821,7 +835,7 @@ function runHitDetection(attacker, defender, g) {
             h.hitTargets.add(defender)
             if (!h.multihit) h.frames = 0
             g.hitstopFrames = Math.max(g.hitstopFrames, 4)
-            g.pendingEvents.push({ type: "hitFx", applyAtFrame: g.frame, data: { x: defender.x + defender.w/2, y: defender.y + defender.h/2, kb: mag, isDrag: true } })
+            g.pendingEvents.push({ type: "hitFx", applyAtFrame: g.frame, data: { x: defender.x + defender.w/2, y: defender.y + defender.h/2, kb: mag, isDrag: true, attackerIdx: g.fighters.indexOf(attacker) } })
             continue
         }
 
@@ -868,13 +882,16 @@ function runHitDetection(attacker, defender, g) {
         h.hitTargets.add(defender)
         if (!h.multihit) h.frames = 0
 
-        g.pendingEvents.push({
+       g.pendingEvents.push({
             type: "hitFx",
             applyAtFrame: g.frame,
             data: {
                 x: defender.x + defender.w/2, y: defender.y + defender.h/2,
                 kb, angle: h.angle, attackerFacing: attacker.facing,
-                isCounter: cr.isCounter, isKill: defender.percent > 200
+                isCounter: cr.isCounter, isKill: defender.percent > 200,
+                attackerIdx: g.fighters.indexOf(attacker),
+                effectiveDamage: effDmg,
+                comboCount: attacker.comboCount
             }
         })
     }
@@ -1062,7 +1079,7 @@ function applyPendingEvent(ev, g) {
         atk.vx = -atk.facing * 10; atk.vy = -8
     }
     // burstWave: apply stun to opponent if in range
-    if (ev.type === "burstWave") {
+   if (ev.type === "burstWave") {
         const opp = g.fighters[1 - ev.data.ownerIdx]
         const dx  = (opp.x + opp.w/2) - ev.data.x
         const dy  = (opp.y + opp.h/2) - ev.data.y
@@ -1072,6 +1089,7 @@ function applyPendingEvent(ev, g) {
             opp.burstParryWindow = BURST_PARRY_WIN
             g.hitstopFrames = Math.max(g.hitstopFrames, 12)
         }
+        // This event is also a VFX signal — ownerIdx already in ev.data, client handles it
     }
 }
 
@@ -1093,7 +1111,8 @@ function buildStatePacket(g) {
         ultimateActive: f.ultimateActive,
         launchKB: f.launchKB,
         trailingPercent: f.trailingPercent,
-        attackLockFrames: f.attackLockFrames
+        attackLockFrames: f.attackLockFrames,
+        comboCount: f.comboCount
     }))
 
     // Flush pending events as client VFX signals
