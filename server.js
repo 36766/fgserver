@@ -1129,95 +1129,329 @@ function buildStatePacket(g) {
         vfxEvents: g.pendingEvents.filter(e => e.applyAtFrame === g.frame).map(e => ({ type: e.type, data: e.data }))
     })
 }
-
-// ─── Session management ───────────────────────────────────────────────────────
-let sessions = []   // { sockets: [s0, s1], inputs: [{held, taps}, ...], characters: [], ready: 0 }
-let waiting   = null
-
+// ─── Utilities ────────────────────────────────────────────────────────────────
 function blankInput() {
-    return { held: { left:false, right:false, jump:false, down:false, attack:false, dash:false, parry:false, ultimate:false }, taps: new Set() }
-}
-
-wss.on("connection", socket => {
-    console.log("Player connected")
-
-    if (!waiting) {
-        waiting = { socket, character: "speedster" }
-        socket.send(JSON.stringify({ type: "playerNumber", number: 0 }))
-        socket.on("message", msg => handleLobbyMessage(socket, msg, 0))
-        socket.on("close", () => { if (waiting && waiting.socket === socket) waiting = null })
-    } else {
-        const p0 = waiting; waiting = null
-        socket.send(JSON.stringify({ type: "playerNumber", number: 1 }))
-
-        const session = {
-            sockets:    [p0.socket, socket],
-            inputs:     [blankInput(), blankInput()],
-            characters: [p0.character, "speedster"],
-            interval:   null
-        }
-        sessions.push(session)
-        startSession(session)
-
-        socket.on("message", msg => handleSessionMessage(session, socket, msg, 1))
-        p0.socket.removeAllListeners("message")
-        p0.socket.on("message", msg => handleSessionMessage(session, p0.socket, msg, 0))
-
-        socket.on("close",    () => endSession(session))
-        p0.socket.on("close", () => endSession(session))
+    return {
+        held: { left:false,right:false,jump:false,down:false,attack:false,dash:false,parry:false,ultimate:false },
+        taps: new Set()
     }
-})
-
-function handleLobbyMessage(socket, msg, idx) {
-    try {
-        const data = JSON.parse(msg)
-        if (data.type === "character" && waiting && waiting.socket === socket) {
-            waiting.character = data.character || "speedster"
-        }
-    } catch(e) {}
 }
 
-function handleSessionMessage(session, socket, msg, idx) {
-    try {
-        const data = JSON.parse(msg)
-        if (data.type === "input") {
-            const inp = session.inputs[idx]
-            if (data.held) inp.held = data.held
-            if (Array.isArray(data.taps)) {
-                for (const t of data.taps) inp.taps.add(t)
-            }
-        }
-    } catch(e) {}
+function generateRoomCode() {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    let code = ""
+    for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)]
+    return code
 }
 
-function startSession(session) {
-    session.game = makeGame(session.characters)
+function broadcastLobby() {
+    const list = [...rooms.values()]
+        .filter(r => r.public)
+        .map(r => ({
+            code:       r.code,
+            players:    r.players.length,
+            spectators: r.spectators.length,
+            inGame:     r.inGame
+        }))
+    const pkt = JSON.stringify({ type: "roomList", rooms: list })
+    wss.clients.forEach(c => {
+        if (c.readyState === WebSocket.OPEN && c._inLobby) c.send(pkt)
+    })
+}
+
+function sendToSocket(socket, obj) {
+    if (socket && socket.readyState === WebSocket.OPEN)
+        socket.send(JSON.stringify(obj))
+}
+
+// ─── Room state ───────────────────────────────────────────────────────────────
+//
+// Room = {
+//   code, public,
+//   players:    [ { socket, charIdx, colorIdx, ready } ],   max 2
+//   spectators: [ socket ],                                  max 4
+//   inGame:     bool,
+//   session:    Session | null
+// }
+//
+// Session = { inputs, game, interval }
+
+const rooms = new Map()          // code → Room
+const quickMatchQueue = []       // sockets waiting for quick match
+
+// ─── Session helpers ──────────────────────────────────────────────────────────
+function startRoomSession(room) {
+    room.inGame = true
+    const characters = room.players.map(p => {
+        const names = ["speedster","mage","ninja"]
+        return names[p.charIdx] || "speedster"
+    })
+    const session = {
+        inputs:   [blankInput(), blankInput()],
+        game:     makeGame(characters),
+        interval: null
+    }
+    room.session = session
+
     session.interval = setInterval(() => {
         const g = session.game
         tick(g, session.inputs)
-        // Clear taps after each tick so they are consumed exactly once
         session.inputs[0].taps.clear()
         session.inputs[1].taps.clear()
 
         const pkt = buildStatePacket(g)
-        for (const s of session.sockets) {
+
+        // Send to players
+        room.players.forEach((p, i) => {
+            if (p.socket && p.socket.readyState === WebSocket.OPEN) p.socket.send(pkt)
+        })
+        // Send to spectators
+        room.spectators.forEach(s => {
             if (s.readyState === WebSocket.OPEN) s.send(pkt)
-        }
+        })
 
         if (g.gameOver) {
             clearInterval(session.interval)
             session.interval = null
+            room.inGame = false
+            // Close room after brief delay
+            setTimeout(() => closeRoom(room.code), 5000)
         }
     }, 1000 / 60)
 }
 
-function endSession(session) {
-    console.log("Session ended")
-    if (session.interval) clearInterval(session.interval)
-    sessions = sessions.filter(s => s !== session)
-    for (const s of session.sockets) {
-        if (s.readyState === WebSocket.OPEN) s.close()
+function closeRoom(code) {
+    const room = rooms.get(code)
+    if (!room) return
+    if (room.session && room.session.interval) {
+        clearInterval(room.session.interval)
+        room.session.interval = null
     }
+    // Notify everyone
+    const pkt = JSON.stringify({ type: "roomClosed" })
+    room.players.forEach(p => { if (p.socket) sendToSocket(p.socket, { type: "roomClosed" }) })
+    room.spectators.forEach(s => sendToSocket(s, { type: "roomClosed" }))
+    rooms.delete(code)
+    broadcastLobby()
+    console.log(`Room ${code} closed`)
+}
+
+// ─── Connection handler ───────────────────────────────────────────────────────
+wss.on("connection", socket => {
+    console.log("Client connected")
+    socket._inLobby   = false
+    socket._roomCode  = null
+    socket._playerIdx = -1
+    socket._spectator = false
+
+    socket.on("message", rawMsg => {
+        let data
+        try { data = JSON.parse(rawMsg) } catch(e) { return }
+        handleClientMessage(socket, data)
+    })
+
+    socket.on("close", () => handleDisconnect(socket))
+})
+
+function handleClientMessage(socket, data) {
+    switch (data.type) {
+
+    // ── Lobby browsing ──────────────────────────────────────────────────
+    case "listRooms": {
+        socket._inLobby = true
+        const list = [...rooms.values()]
+            .filter(r => r.public)
+            .map(r => ({
+                code:       r.code,
+                players:    r.players.length,
+                spectators: r.spectators.length,
+                inGame:     r.inGame
+            }))
+        sendToSocket(socket, { type: "roomList", rooms: list })
+        break
+    }
+
+    // ── Create room ─────────────────────────────────────────────────────
+    case "createRoom": {
+        // Generate a unique code
+        let code = generateRoomCode()
+        while (rooms.has(code)) code = generateRoomCode()
+
+        const room = {
+            code, public: true,
+            players:    [{ socket, charIdx: 0, colorIdx: 0, ready: false }],
+            spectators: [],
+            inGame:     false,
+            session:    null
+        }
+        rooms.set(code, room)
+        socket._inLobby  = false
+        socket._roomCode = code
+        socket._playerIdx = 0
+
+        sendToSocket(socket, { type: "roomCreated", code })
+        sendToSocket(socket, { type: "roomJoined",  playerIdx: 0 })
+        broadcastLobby()
+        console.log(`Room ${code} created`)
+        break
+    }
+
+    // ── Join room ───────────────────────────────────────────────────────
+    case "joinRoom": {
+        const room = rooms.get(data.code)
+        if (!room) { sendToSocket(socket, { type: "roomError", message: "Room not found." }); break }
+        if (room.players.length >= 2) { sendToSocket(socket, { type: "roomError", message: "Room is full." }); break }
+        if (room.inGame) { sendToSocket(socket, { type: "roomError", message: "Game already in progress." }); break }
+
+        room.players.push({ socket, charIdx: 2, colorIdx: 1, ready: false })
+        socket._inLobby   = false
+        socket._roomCode  = data.code
+        socket._playerIdx = 1
+
+        sendToSocket(socket, { type: "roomJoined", playerIdx: 1 })
+        broadcastLobby()
+        console.log(`Player joined room ${data.code}`)
+        break
+    }
+
+    // ── Spectate room ───────────────────────────────────────────────────
+    case "spectateRoom": {
+        const room = rooms.get(data.code)
+        if (!room) { sendToSocket(socket, { type: "roomError", message: "Room not found." }); break }
+        if (room.spectators.length >= 4) { sendToSocket(socket, { type: "roomError", message: "Spectator seats full." }); break }
+
+        room.spectators.push(socket)
+        socket._inLobby   = false
+        socket._roomCode  = data.code
+        socket._spectator = true
+
+        sendToSocket(socket, { type: "spectateJoined", code: data.code })
+        console.log(`Spectator joined room ${data.code}`)
+        break
+    }
+
+    // ── Quick match ─────────────────────────────────────────────────────
+    case "quickMatch": {
+        // Remove stale entries
+        const queueIdx = quickMatchQueue.indexOf(socket)
+        if (queueIdx !== -1) break   // already queued
+
+        // Check if there's someone waiting
+        const waiting = quickMatchQueue.find(s => s.readyState === WebSocket.OPEN)
+        if (waiting) {
+            // Found a match
+            quickMatchQueue.splice(quickMatchQueue.indexOf(waiting), 1)
+
+            let code = generateRoomCode()
+            while (rooms.has(code)) code = generateRoomCode()
+
+            const room = {
+                code, public: true,
+                players: [
+                    { socket: waiting, charIdx: 0, colorIdx: 0, ready: false },
+                    { socket,          charIdx: 2, colorIdx: 1, ready: false }
+                ],
+                spectators: [],
+                inGame:     false,
+                session:    null
+            }
+            rooms.set(code, room)
+
+            waiting._roomCode  = code; waiting._playerIdx = 0; waiting._inLobby = false
+            socket._roomCode   = code; socket._playerIdx  = 1; socket._inLobby  = false
+
+            sendToSocket(waiting, { type: "quickMatchFound", playerIdx: 0 })
+            sendToSocket(socket,  { type: "quickMatchFound", playerIdx: 1 })
+            broadcastLobby()
+            console.log(`Quick match: room ${code}`)
+        } else {
+            quickMatchQueue.push(socket)
+        }
+        break
+    }
+
+    case "cancelQuickMatch": {
+        const qi = quickMatchQueue.indexOf(socket)
+        if (qi !== -1) quickMatchQueue.splice(qi, 1)
+        break
+    }
+
+    // ── Close own room ──────────────────────────────────────────────────
+    case "closeRoom": {
+        if (socket._roomCode) closeRoom(socket._roomCode)
+        break
+    }
+
+    // ── Character select ready ──────────────────────────────────────────
+    case "csReady": {
+        const room = rooms.get(socket._roomCode)
+        if (!room) break
+        const idx = socket._playerIdx
+        if (idx < 0 || idx > 1) break
+
+        room.players[idx].charIdx  = data.charIdx  ?? room.players[idx].charIdx
+        room.players[idx].colorIdx = data.colorIdx ?? room.players[idx].colorIdx
+        room.players[idx].ready    = !!data.ready
+
+        // Broadcast to the other player in the room
+        const other = room.players[1 - idx]
+        if (other && other.socket) {
+            sendToSocket(other.socket, {
+                type:     "opponentCharReady",
+                charIdx:  room.players[idx].charIdx,
+                colorIdx: room.players[idx].colorIdx,
+                ready:    room.players[idx].ready
+            })
+        }
+
+        // Both ready → start game
+        if (room.players.length === 2 &&
+            room.players[0].ready &&
+            room.players[1].ready &&
+            !room.inGame) {
+            startRoomSession(room)
+        }
+        break
+    }
+
+    // ── In-game input ───────────────────────────────────────────────────
+    case "input": {
+        const room = rooms.get(socket._roomCode)
+        if (!room || !room.session) break
+        const idx = socket._playerIdx
+        if (idx < 0 || idx > 1) break
+
+        const inp = room.session.inputs[idx]
+        if (data.held) inp.held = data.held
+        if (Array.isArray(data.taps)) {
+            for (const t of data.taps) inp.taps.add(typeof t === "string" ? t : t.action)
+        }
+        break
+    }
+
+    default: break
+    }
+}
+
+function handleDisconnect(socket) {
+    // Remove from quick match queue
+    const qi = quickMatchQueue.indexOf(socket)
+    if (qi !== -1) quickMatchQueue.splice(qi, 1)
+
+    // Remove from room
+    const code = socket._roomCode
+    if (!code) { broadcastLobby(); return }
+
+    const room = rooms.get(code)
+    if (!room) return
+
+    if (socket._spectator) {
+        room.spectators = room.spectators.filter(s => s !== socket)
+    } else {
+        // A player disconnected — end the session
+        closeRoom(code)
+    }
+    broadcastLobby()
 }
 
 console.log(`Server running on port ${PORT}`)
