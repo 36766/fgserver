@@ -633,8 +633,34 @@ function dashTo(f, opp, g) {
     const dist = Math.hypot(ox - sx, oy - sy) || 1
     const ux = (ox - sx) / dist, uy = (oy - sy) / dist
     const OVERSHOOT = 150
-    f.x = ox + ux * OVERSHOOT - f.w / 2
-    f.y = oy + uy * OVERSHOOT - f.h / 2
+
+    let arrivalX = ox + ux * OVERSHOOT
+    let arrivalY = oy + uy * OVERSHOOT
+
+    const DASH_MARGIN = 60
+    arrivalX = Math.max(blast.left + DASH_MARGIN, Math.min(blast.right - DASH_MARGIN, arrivalX))
+    arrivalY = Math.max(blast.top + DASH_MARGIN, Math.min(blast.bottom - DASH_MARGIN, arrivalY))
+
+    let destX = arrivalX - f.w / 2
+    let destY = arrivalY - f.h / 2
+    for (const p of platforms) {
+        if (p.topOnly) continue
+        const overlapsX = destX + f.w > p.x && destX < p.x + p.w
+        const overlapsY = destY + f.h > p.y && destY < p.y + p.h
+        if (overlapsX && overlapsY) {
+            if (Math.abs(ux) > Math.abs(uy)) {
+                destX = ux > 0 ? p.x - f.w - 2 : p.x + p.w + 2
+            } else {
+                destY = uy > 0 ? p.y - f.h - 2 : p.y + p.h + 2
+            }
+            arrivalX = destX + f.w / 2
+            arrivalY = destY + f.h / 2
+            break
+        }
+    }
+
+    f.x = destX
+    f.y = destY
     f.vx = 0; f.vy = 0; f.doubleJump = true
 
     const dashKB = 16
@@ -653,8 +679,8 @@ function dashTo(f, opp, g) {
     const SHOCK_SPACING   = 140
     if (rawDist > SHORT_THRESHOLD) {
         const shockCount = Math.max(1, Math.floor((rawDist - SHORT_THRESHOLD) / SHOCK_SPACING))
-        const totalDX = (ox + ux * OVERSHOOT) - sx
-        const totalDY = (oy + uy * OVERSHOOT) - sy
+        const totalDX = arrivalX - sx
+        const totalDY = arrivalY - sy
         for (let i = 0; i < shockCount; i++) {
             const t = (i + 1) / (shockCount + 1)
             g.pendingEvents.push({
@@ -926,7 +952,12 @@ function resolveDI(f, inp) {
 
 // ─── Blast zone / respawn ─────────────────────────────────────────────────────
 function checkBlast(f, idx, g) {
-    if (f.x >= blast.left && f.x <= blast.right && f.y >= blast.top && f.y <= blast.bottom) return
+    const extraMargin = 150
+    const bL = f.hitstun > 0 ? blast.left   : blast.left   - extraMargin
+    const bR = f.hitstun > 0 ? blast.right  : blast.right  + extraMargin
+    const bT = f.hitstun > 0 ? blast.top    : blast.top    - extraMargin
+    const bB = f.hitstun > 0 ? blast.bottom : blast.bottom + extraMargin
+    if (f.x >= bL && f.x <= bR && f.y >= bT && f.y <= bB) return
     f.percent = 0; f.trailingPercent = 0; f.stocks--
     f.comboCount = 0; f.comboVictim = null
     g.pendingEvents.push({ type: "blastFx", applyAtFrame: g.frame, data: { x: Math.max(-300, Math.min(CANVAS_W + 300, f.x + f.w/2)), y: Math.max(-300, Math.min(CANVAS_H + 300, f.y + f.h/2)) } })
