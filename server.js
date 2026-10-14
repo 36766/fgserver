@@ -6,6 +6,7 @@ const PORT = process.env.PORT || 10000
 // maxPayload: real messages are a few hundred bytes; anything big is junk.
 const wss = new WebSocket.Server({ port: PORT, perMessageDeflate: false, maxPayload: 4096 })
 
+// ==SIM_BEGIN== (shared with the client: embed_sim.js copies everything up to SIM_END into the HTML game)
 // ─── Network tuning ──────────────────────────────────────────────────────────
 const TICK_MS             = 1000 / 60
 const MAX_CATCHUP_TICKS   = 3          // after a stall, run at most this many ticks back-to-back, then resync
@@ -13,7 +14,7 @@ const SPIN_MS             = 2          // last stretch before a tick is waited o
 const TAP_BUFFER_TICKS    = 6          // a tap pressed during hitstop/freeze survives this long (client: INPUT_BUFFER_FRAMES)
 const MAX_BUFFERED_BYTES  = 8 * 1024   // per-socket send backlog above which a snapshot is dropped instead of queued
 const PING_INTERVAL_MS    = 20000      // keepalive + dead-peer detection
-const NET_DEBUG           = !!process.env.NET_DEBUG   // NET_DEBUG=1 logs tick lateness / cost every 5 s
+const NET_DEBUG           = (typeof process !== "undefined") && !!process.env.NET_DEBUG   // NET_DEBUG=1 logs tick lateness / cost every 5 s
 const NET_ACTIONS         = new Set(["left","right","jump","down","attack","dash","parry","ultimate"])
 
 // ─── Physics constants (must match client) ───────────────────────────────────
@@ -2039,6 +2040,43 @@ function endTickTaps(inp, controlsRan) {
     }
 }
 
+// ==SIM_END==
+
+// ─── Client-side prediction support (shadow mode) ────────────────────────────
+// A client that sends {type:"netopt", shadow:true} gets a `pred` block in its snapshots:
+//   ack  = ct of the newest input message applied (the client's own tick counter when it sent it)
+//   at   = the server tick that message was applied on  -> the client works out the tick offset from (at - ct)
+//   ok   = the fighter is in a state the client can simulate on its own (no hit-stun, freeze, attack boxes, ...)
+//   full = every fighter field that differs from a fresh fighter, so the client can rebuild the exact state
+function predictable(f, g) {
+    return f.hitstun <= 0 && f.freezeFrames <= 0 && g.hitstopFrames <= 0 && g.attackerFreezeFrames <= 0 &&
+           !f.releaseFn && !f.pendingLaunch && !f.grapple && f.hitboxes.length === 0 && f.delayedHitboxes.length === 0 &&
+           !f.ultimateActive && f.burstHoverFrames <= 0 && f.parryDashFrames <= 0 && g.witchTime.frames <= 0 &&
+           g.pendingBursts.length === 0
+}
+
+function diffFighter(f, idx) {
+    const base = makeFighter(idx, f.characterName)
+    const out = {}
+    for (const k of Object.keys(f)) {
+        const v = f[k], b = base[k]
+        if (v === null || typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
+            if (v !== b) out[k] = v
+        } else if (Array.isArray(v)) {
+            if (v.length && v.every(e => typeof e === "string" || typeof e === "number")) out[k] = v
+        }
+    }
+    return out
+}
+
+function buildPred(g, idx, inp) {
+    const f  = g.fighters[idx]
+    const ok = predictable(f, g)
+    const pred = { ack: inp.ackCt === undefined ? -1 : inp.ackCt, at: inp.ackTick || 0, ok }
+    if (ok) pred.full = diffFighter(f, idx)
+    return pred
+}
+
 function generateRoomCode() {
     const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     let code = ""
@@ -2162,7 +2200,12 @@ function startRoomSession(room) {
         const obj  = buildStateObject(g)
         const json = JSON.stringify(obj)
         const force = g.gameOver
-        room.players.forEach(p => sendState(p.socket, obj, json, force))
+        room.players.forEach((p, i) => {
+            if (p.socket && p.socket._shadow) {
+                const o = Object.assign({}, obj, { pred: buildPred(g, i, session.inputs[i]) })
+                sendState(p.socket, o, JSON.stringify(o), force)
+            } else sendState(p.socket, obj, json, force)
+        })
         room.spectators.forEach(s => sendState(s, obj, json, force))
 
         if (g.gameOver) {
@@ -2300,6 +2343,12 @@ function handleClientMessage(socket, data) {
         break
     }
 
+    // ── Per-connection options (prediction shadow mode) ─────────────────
+    case "netopt": {
+        socket._shadow = !!data.shadow
+        break
+    }
+
     // ── Close own room ──────────────────────────────────────────────────
     case "closeRoom": {
         if (socket._roomCode) closeRoom(socket._roomCode)
@@ -2344,6 +2393,7 @@ function handleClientMessage(socket, data) {
         if (idx < 0 || idx > 1) break
 
         const inp = room.session.inputs[idx]
+        if (typeof data.ct === "number") { inp.ackCt = data.ct; inp.ackTick = room.session.game.frame + 1 }   // applied on the next tick
         if (data.held && typeof data.held === "object") {
             for (const a of NET_ACTIONS) inp.held[a] = !!data.held[a]
         }
