@@ -2079,7 +2079,6 @@ function sendToSocket(socket, obj) {
 // Session = { inputs, game, interval }
 
 const rooms = new Map()          // code → Room
-const quickMatchQueue = []       // sockets waiting for quick match
 
 // ─── Session helpers ──────────────────────────────────────────────────────────
 
@@ -2295,46 +2294,9 @@ function handleClientMessage(socket, data) {
         break
     }
 
-    // ── Quick match ─────────────────────────────────────────────────────
-    case "quickMatch": {
-        const queueIdx = quickMatchQueue.indexOf(socket)
-        if (queueIdx !== -1) break   // already queued
-
-        const waiting = quickMatchQueue.find(s => s.readyState === WebSocket.OPEN)
-        if (waiting) {
-            quickMatchQueue.splice(quickMatchQueue.indexOf(waiting), 1)
-
-            let code = generateRoomCode()
-            while (rooms.has(code)) code = generateRoomCode()
-
-            const room = {
-                code, public: true,
-                players: [
-                    { socket: waiting, charIdx: 0, colorIdx: 0, ready: false },
-                    { socket,          charIdx: 2, colorIdx: 1, ready: false }
-                ],
-                spectators: [],
-                inGame:     false,
-                session:    null
-            }
-            rooms.set(code, room)
-
-            waiting._roomCode  = code; waiting._playerIdx = 0; waiting._inLobby = false
-            socket._roomCode   = code; socket._playerIdx  = 1; socket._inLobby  = false
-
-            sendToSocket(waiting, { type: "quickMatchFound", playerIdx: 0 })
-            sendToSocket(socket,  { type: "quickMatchFound", playerIdx: 1 })
-            broadcastLobby()
-            console.log(`Quick match: room ${code}`)
-        } else {
-            quickMatchQueue.push(socket)
-        }
-        break
-    }
-
-    case "cancelQuickMatch": {
-        const qi = quickMatchQueue.indexOf(socket)
-        if (qi !== -1) quickMatchQueue.splice(qi, 1)
+    // ── Latency probe (answered immediately, not tick-aligned) ──────────
+    case "ping": {
+        if (socket.readyState === WebSocket.OPEN) socket.send('{"type":"pong","t":' + (+data.t || 0) + '}')
         break
     }
 
@@ -2399,9 +2361,6 @@ function handleClientMessage(socket, data) {
 }
 
 function handleDisconnect(socket) {
-    const qi = quickMatchQueue.indexOf(socket)
-    if (qi !== -1) quickMatchQueue.splice(qi, 1)
-
     const code = socket._roomCode
     if (!code) { broadcastLobby(); return }
 
