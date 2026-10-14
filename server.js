@@ -2072,7 +2072,8 @@ function diffFighter(f, idx) {
 function buildPred(g, idx, inp) {
     const f  = g.fighters[idx]
     const ok = predictable(f, g)
-    const pred = { ack: inp.ackCt === undefined ? -1 : inp.ackCt, at: inp.ackTick || 0, ok }
+    const pred = { ack: inp.ackCt === undefined ? -1 : inp.ackCt, at: inp.ackTick || 0,
+                   ch: inp.chCt === undefined ? -1 : inp.chCt, chAt: inp.chTick || 0, ok }
     if (ok) pred.full = diffFighter(f, idx)
     return pred
 }
@@ -2393,7 +2394,16 @@ function handleClientMessage(socket, data) {
         if (idx < 0 || idx > 1) break
 
         const inp = room.session.inputs[idx]
-        if (typeof data.ct === "number") { inp.ackCt = data.ct; inp.ackTick = room.session.game.frame + 1 }   // applied on the next tick
+        if (typeof data.ct === "number") {
+            inp.ackCt = data.ct; inp.ackTick = room.session.game.frame + 1   // applied on the next tick
+            // Is this a real change (a press, a release, a tap) or just a keep-alive? The client lines its timeline up
+            // against the last real change, because only a change can arrive "late" in a way that matters.
+            let changed = Array.isArray(data.taps) && data.taps.length > 0
+            if (!changed && data.held && typeof data.held === "object") {
+                for (const a of NET_ACTIONS) if (!!data.held[a] !== !!inp.held[a]) { changed = true; break }
+            }
+            if (changed) { inp.chCt = data.ct; inp.chTick = inp.ackTick }
+        }
         if (data.held && typeof data.held === "object") {
             for (const a of NET_ACTIONS) inp.held[a] = !!data.held[a]
         }
