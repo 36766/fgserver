@@ -1923,6 +1923,8 @@ function buildStateObject(g) {
         fighters,
         witchTime: g.witchTime,
         hitstopFrames: g.hitstopFrames,
+        attackerFreezeFrames: g.attackerFreezeFrames,
+        attackerFreezeIdx: g.attackerFreezeIdx,
         gameOver: g.gameOver,
         winnerIdx: g.winnerIdx,
         vfxEvents: g.vfxOut
