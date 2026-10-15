@@ -2050,9 +2050,9 @@ function endTickTaps(inp, controlsRan) {
 //   at   = the server tick that message was applied on  -> the client works out the tick offset from (at - ct)
 //   ok   = the fighter is in a state the client can simulate on its own (no hit-stun, freeze, attack boxes, ...)
 //   full = every fighter field that differs from a fresh fighter, so the client can rebuild the exact state
-function predictable(f, g) {
+function predictable(f, g, ignoreHitboxes) {
     return f.hitstun <= 0 && f.freezeFrames <= 0 && g.hitstopFrames <= 0 && g.attackerFreezeFrames <= 0 &&
-           !f.releaseFn && !f.pendingLaunch && !f.grapple && f.hitboxes.length === 0 && f.delayedHitboxes.length === 0 &&
+           !f.releaseFn && !f.pendingLaunch && !f.grapple && (ignoreHitboxes || (f.hitboxes.length === 0 && f.delayedHitboxes.length === 0)) &&
            !f.ultimateActive && f.burstHoverFrames <= 0 && f.parryDashFrames <= 0 && g.witchTime.frames <= 0 &&
            g.pendingBursts.length === 0
 }
@@ -2074,8 +2074,11 @@ function diffFighter(f, idx) {
 function buildPred(g, idx, inp) {
     const f  = g.fighters[idx]
     const ok = predictable(f, g)
+    // atk: the ONLY thing stopping `ok` is the fighter's own live attack hitboxes (no hit, freeze, launch, ...). The client keeps its
+    // running prediction through that instead of switching to server data every time it attacks.
+    const atk = !ok && predictable(f, g, true)
     const pred = { ack: inp.ackCt === undefined ? -1 : inp.ackCt, at: inp.ackTick || 0,
-                   ch: inp.chCt === undefined ? -1 : inp.chCt, chAt: inp.chTick || 0, ok }
+                   ch: inp.chCt === undefined ? -1 : inp.chCt, chAt: inp.chTick || 0, ok, atk }
     if (ok) pred.full = diffFighter(f, idx)
     return pred
 }
